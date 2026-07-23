@@ -32,6 +32,7 @@ import re
 import sys
 import json
 import platform
+import threading
 import subprocess
 import traceback
 from dataclasses import dataclass, field
@@ -80,7 +81,10 @@ class SourceConfig:
     search_header: str              # 검색할 열의 헤더명 (또는 헤더 없음일 때는 열 문자, 예: "C")
     match_mode: str = "contains"    # "exact" | "contains"
     enabled: bool = True
-    has_header: bool = True         # False면 1행부터 데이터로 취급하고 열을 A,B,C.. 문자로 지정
+    has_header: bool = True         # False면 지정한 행부터 데이터로 취급하고 열을 A,B,C.. 문자로 지정
+    start_row: int = 1              # 헤더가 있으면 헤더가 위치한 행 번호, 없으면 데이터가 시작하는 행 번호
+                                     # (위쪽에 빈 행/제목行/병합된 행이 있을 때 그 다음 실제 행을 지정)
+    resolve_merges: bool = False    # True면 병합된 셀 값을 병합 범위 전체에 채워 넣음(느림). 필요할 때만 켤 것
     columns: List[ColumnMap] = field(default_factory=list)
 
 
@@ -94,47 +98,116 @@ class OutputColumn:
 # 엑셀 읽기 캐시 & 검색 로직
 # ---------------------------------------------------------------------------
 
+def _read_sheet_fast(file_path: str, sheet_name: str) -> Tuple[List[list], int]:
+    """read_only 모드로 값만 빠르게 읽는다. 병합 셀 보정은 하지 않음.
+    read_only 모드는 병합 정보를 제공하지 않는 대신, 셀 객체를 만들지 않고
+    스트리밍으로 읽기 때문에 수천~수만 행짜리 파일에서도 훨씬 빠르고
+    메모리를 적게 쓴다. 대부분의 파일(병합 셀이 없는 표 형태)에는 이 방식으로 충분하다.
+    """
+    wb = load_workbook(file_path, read_only=True, data_only=True)
+    try:
+        if sheet_name not in wb.sheetnames:
+            raise ValueError(f"시트 '{sheet_name}' 를 '{os.path.basename(file_path)}' 에서 찾을 수 없습니다.")
+        ws = wb[sheet_name]
+        rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    finally:
+        wb.close()
+
+    max_col = max((len(r) for r in rows), default=0)
+    for row in rows:
+        if len(row) < max_col:
+            row.extend([None] * (max_col - len(row)))
+    return rows, max_col
+
+
+def _read_sheet_with_merges(file_path: str, sheet_name: str) -> Tuple[List[list], int]:
+    """시트의 모든 행을 읽되, 병합된 셀은 병합 범위 전체에 대표(좌상단) 값을
+    채워 넣은 2차원 리스트로 반환한다. (헤더/값이 병합되어 있어 특정 행에서만
+    값이 잡히는 문제를 해결하기 위함)
+
+    반환값: (rows, max_col) - rows는 각 행이 list인 2차원 리스트, max_col은 시트의 최대 열 수.
+    """
+    # 병합 정보(merged_cells)는 read_only 모드에서 제공되지 않으므로 일반 모드로 읽는다.
+    wb = load_workbook(file_path, data_only=True)
+    try:
+        if sheet_name not in wb.sheetnames:
+            raise ValueError(f"시트 '{sheet_name}' 를 '{os.path.basename(file_path)}' 에서 찾을 수 없습니다.")
+        ws = wb[sheet_name]
+
+        rows = [list(r) for r in ws.iter_rows(values_only=True)]
+        max_col = ws.max_column or (max((len(r) for r in rows), default=0))
+        for row in rows:
+            if len(row) < max_col:
+                row.extend([None] * (max_col - len(row)))
+
+        for rng in ws.merged_cells.ranges:
+            anchor_r, anchor_c = rng.min_row, rng.min_col
+            if anchor_r - 1 >= len(rows) or anchor_c - 1 >= max_col:
+                continue
+            anchor_val = rows[anchor_r - 1][anchor_c - 1]
+            for r in range(rng.min_row, rng.max_row + 1):
+                if r - 1 >= len(rows):
+                    continue
+                row = rows[r - 1]
+                for c in range(rng.min_col, rng.max_col + 1):
+                    if c - 1 < len(row) and row[c - 1] is None:
+                        row[c - 1] = anchor_val
+        return rows, max_col
+    finally:
+        wb.close()
+
+
+def _split_headers_and_data(rows: List[list], max_col: int, has_header: bool,
+                             start_row: int) -> Tuple[List[str], List[tuple]]:
+    """읽어들인 2차원 데이터에서, 지정한 시작 행부터 헤더/데이터를 분리한다."""
+    idx = max(start_row - 1, 0)
+    if has_header:
+        header_row = rows[idx] if idx < len(rows) else []
+        headers = [("" if h is None else str(h).strip()) for h in header_row]
+        data_rows = [tuple(r) for r in rows[idx + 1:]]
+    else:
+        data_rows = [tuple(r) for r in rows[idx:]]
+        headers = [get_column_letter(i) for i in range(1, max_col + 1)]
+    return headers, data_rows
+
+
 class SheetCache:
-    """동일 (파일, 시트)를 여러 검색어에 대해 반복해서 여는 것을 방지"""
+    """동일 (파일, 시트)의 원본 데이터를 한 번만 디스크에서 읽고 재사용한다.
+    소스 설정 다이얼로그와 검색 실행이 이 캐시를 공유하므로, 같은 파일을
+    여러 번 참조/편집해도 디스크 읽기는 최초 1회만 발생한다."""
 
     def __init__(self):
-        self._cache: Dict[Tuple[str, str, bool], Tuple[List[str], List[tuple]]] = {}
+        # (file_path, sheet_name, resolve_merges) -> (rows, max_col) : 원본 2차원 데이터
+        self._raw_cache: Dict[Tuple[str, str, bool], Tuple[List[list], int]] = {}
+        # (file_path, sheet_name, resolve_merges, has_header, start_row) -> (headers, data_rows)
+        self._cache: Dict[Tuple[str, str, bool, bool, int], Tuple[List[str], List[tuple]]] = {}
 
-    def get(self, file_path: str, sheet_name: str, has_header: bool = True) -> Tuple[List[str], List[tuple]]:
-        key = (file_path, sheet_name, has_header)
+    def _get_raw(self, file_path: str, sheet_name: str, resolve_merges: bool) -> Tuple[List[list], int]:
+        key = (file_path, sheet_name, resolve_merges)
+        if key in self._raw_cache:
+            return self._raw_cache[key]
+        if resolve_merges:
+            rows, max_col = _read_sheet_with_merges(file_path, sheet_name)
+        else:
+            rows, max_col = _read_sheet_fast(file_path, sheet_name)
+        self._raw_cache[key] = (rows, max_col)
+        return rows, max_col
+
+    def get(self, file_path: str, sheet_name: str, has_header: bool = True,
+            start_row: int = 1, resolve_merges: bool = False) -> Tuple[List[str], List[tuple]]:
+        key = (file_path, sheet_name, resolve_merges, has_header, start_row)
         if key in self._cache:
             return self._cache[key]
 
-        wb = load_workbook(file_path, data_only=True, read_only=True)
-        try:
-            if sheet_name not in wb.sheetnames:
-                raise ValueError(f"시트 '{sheet_name}' 를 '{os.path.basename(file_path)}' 에서 찾을 수 없습니다.")
-            ws = wb[sheet_name]
-
-            if has_header:
-                rows_iter = ws.iter_rows(values_only=True)
-                try:
-                    header_row = next(rows_iter)
-                except StopIteration:
-                    header_row = ()
-                headers = [("" if h is None else str(h).strip()) for h in header_row]
-                data_rows = list(rows_iter)
-            else:
-                # 헤더가 없는 시트: 1행부터 전부 데이터로 취급하고,
-                # 열은 실제 엑셀 열 문자(A, B, C ...)로 지정한다.
-                data_rows = list(ws.iter_rows(values_only=True))
-                max_col = ws.max_column or 0
-                if data_rows:
-                    max_col = max(max_col, max(len(r) for r in data_rows))
-                headers = [get_column_letter(i) for i in range(1, max_col + 1)]
-        finally:
-            wb.close()
+        rows, max_col = self._get_raw(file_path, sheet_name, resolve_merges)
+        headers, data_rows = _split_headers_and_data(rows, max_col, has_header, start_row)
 
         self._cache[key] = (headers, data_rows)
         return headers, data_rows
 
     def clear(self):
         self._cache.clear()
+        self._raw_cache.clear()
 
     @staticmethod
     def list_sheets(file_path: str) -> List[str]:
@@ -174,7 +247,8 @@ def resolve_column_ref(value: str, headers: List[str]) -> str:
 
 
 def search_in_config(config: SourceConfig, headers: List[str], data_rows: List[tuple],
-                      term: str, case_insensitive: bool) -> List[Dict[str, object]]:
+                      term: str, case_insensitive: bool, ignore_space: bool = False
+                      ) -> List[Dict[str, object]]:
     """지정한 검색열에서 term 과 일치(또는 포함)하는 모든 행을 찾아
     가져올 열(alias)들의 값을 담은 dict 목록으로 반환. 중복 행 전부 포함."""
     results: List[Dict[str, object]] = []
@@ -189,6 +263,8 @@ def search_in_config(config: SourceConfig, headers: List[str], data_rows: List[t
             alias_to_idx[cm.alias] = headers.index(cm.source_header)
 
     term_norm = str(term).strip()
+    if ignore_space:
+        term_norm = re.sub(r"\s+", "", term_norm)
     term_cmp = term_norm.lower() if case_insensitive else term_norm
 
     for row in data_rows:
@@ -196,6 +272,8 @@ def search_in_config(config: SourceConfig, headers: List[str], data_rows: List[t
             continue
         cell_val = row[search_idx]
         cell_str = "" if cell_val is None else str(cell_val).strip()
+        if ignore_space:
+            cell_str = re.sub(r"\s+", "", cell_str)
         cell_cmp = cell_str.lower() if case_insensitive else cell_str
 
         if config.match_mode == "exact":
@@ -236,7 +314,7 @@ class SourceConfigDialog(tk.Toplevel):
     def __init__(self, master, config: Optional[SourceConfig] = None):
         super().__init__(master)
         self.title("소스(탭) 설정")
-        self.geometry("620x560")
+        self.geometry("640x590")
         self.resizable(False, False)
         self.grab_set()
 
@@ -274,23 +352,38 @@ class SourceConfigDialog(tk.Toplevel):
 
         self.var_no_header = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            frm_top, text="이 시트는 헤더(제목행)가 없음 - 1행부터 데이터, 열은 A,B,C.. 로 지정",
+            frm_top, text="이 시트는 헤더(제목행)가 없음 - 지정한 행부터 데이터, 열은 A,B,C.. 로 지정",
             variable=self.var_no_header, command=self._load_headers
         ).grid(row=2, column=2, columnspan=2, sticky="w", padx=(12, 0))
 
-        ttk.Label(frm_top, text="검색할 열:").grid(row=3, column=0, sticky="w")
+        ttk.Label(frm_top, text="헤더/데이터 시작 행:").grid(row=3, column=0, sticky="w")
+        self.var_start_row = tk.IntVar(value=1)
+        self.sb_start_row = ttk.Spinbox(
+            frm_top, from_=1, to=100000, textvariable=self.var_start_row, width=8,
+            command=self._load_headers
+        )
+        self.sb_start_row.grid(row=3, column=1, sticky="w")
+        self.sb_start_row.bind("<FocusOut>", lambda e: self._load_headers())
+        self.sb_start_row.bind("<Return>", lambda e: self._load_headers())
+        ttk.Label(
+            frm_top,
+            text="(위쪽에 빈 행/제목行/병합된 행이 있으면 실제 헤더(또는 데이터)가 시작되는 행 번호를 입력. 병합된 셀은 값이 자동으로 채워집니다)",
+            foreground="#666", wraplength=340, justify="left"
+        ).grid(row=3, column=2, columnspan=2, sticky="w", padx=(12, 0))
+
+        ttk.Label(frm_top, text="검색할 열:").grid(row=4, column=0, sticky="w")
         self.var_search_col = tk.StringVar()
         self.cb_search_col = ttk.Combobox(frm_top, textvariable=self.var_search_col, width=30)
-        self.cb_search_col.grid(row=3, column=1, sticky="w")
+        self.cb_search_col.grid(row=4, column=1, sticky="w")
         ttk.Label(
             frm_top, text="(목록에서 선택하거나, 열 문자를 직접 입력해도 됩니다. 예: C)",
             foreground="#666"
-        ).grid(row=3, column=2, columnspan=2, sticky="w", padx=(12, 0))
+        ).grid(row=4, column=2, columnspan=2, sticky="w", padx=(12, 0))
 
-        ttk.Label(frm_top, text="검색 방식:").grid(row=4, column=0, sticky="w")
+        ttk.Label(frm_top, text="검색 방식:").grid(row=5, column=0, sticky="w")
         self.var_match = tk.StringVar(value="contains")
         frm_match = ttk.Frame(frm_top)
-        frm_match.grid(row=4, column=1, sticky="w")
+        frm_match.grid(row=5, column=1, sticky="w")
         ttk.Radiobutton(frm_match, text="부분일치(포함)", variable=self.var_match, value="contains").pack(side="left")
         ttk.Radiobutton(frm_match, text="완전일치", variable=self.var_match, value="exact").pack(side="left")
 
@@ -358,17 +451,15 @@ class SourceConfigDialog(tk.Toplevel):
         if not path or not sheet:
             return
         try:
-            wb = load_workbook(path, read_only=True)
-            ws = wb[sheet]
-            if self.var_no_header.get():
-                # 헤더 없음: 시트의 실제 폭만큼 A, B, C.. 열 문자를 목록으로 제공
-                max_col = ws.max_column or 0
-                headers = [get_column_letter(i) for i in range(1, max_col + 1)]
-            else:
-                first_row = next(ws.iter_rows(values_only=True), ())
-                headers = [("" if h is None else str(h).strip()) for h in first_row]
+            start_row = max(int(self.var_start_row.get() or 1), 1)
+        except (tk.TclError, ValueError):
+            start_row = 1
+        try:
+            rows, max_col = _read_sheet_with_merges(path, sheet)
+            has_header = not self.var_no_header.get()
+            headers, _ = _split_headers_and_data(rows, max_col, has_header, start_row)
+            if has_header:
                 headers = [h for h in headers if h != ""]
-            wb.close()
         except Exception as e:
             messagebox.showerror("오류", f"시트를 읽는 중 오류가 발생했습니다:\n{e}", parent=self)
             return
@@ -411,6 +502,7 @@ class SourceConfigDialog(tk.Toplevel):
             pass
         self.var_sheet.set(config.sheet_name)
         self.var_no_header.set(not config.has_header)
+        self.var_start_row.set(config.start_row)
         self._load_headers()
         self.var_search_col.set(config.search_header)
         self.var_match.set(config.match_mode)
@@ -447,6 +539,11 @@ class SourceConfigDialog(tk.Toplevel):
 
         enabled = self._editing.enabled if self._editing is not None else True
 
+        try:
+            start_row = max(int(self.var_start_row.get() or 1), 1)
+        except (tk.TclError, ValueError):
+            start_row = 1
+
         self.result = SourceConfig(
             label=label,
             file_path=file_path,
@@ -455,6 +552,7 @@ class SourceConfigDialog(tk.Toplevel):
             match_mode=self.var_match.get(),
             enabled=enabled,
             has_header=not self.var_no_header.get(),
+            start_row=start_row,
             columns=columns,
         )
         self.destroy()
@@ -509,16 +607,17 @@ class ExcelSearchMergerApp(tk.Tk):
         frm = self.tab_sources
 
         self.tree_sources = ttk.Treeview(
-            frm, columns=("use", "label", "file", "sheet", "header", "search", "cols"),
+            frm, columns=("use", "label", "file", "sheet", "header", "start_row", "search", "cols"),
             show="headings", height=14
         )
         headers = [
-            ("use", "사용", 50), ("label", "탭이름", 120), ("file", "파일", 220),
-            ("sheet", "시트", 100), ("header", "헤더", 60), ("search", "검색열", 100), ("cols", "가져올열 수", 90),
+            ("use", "사용", 50), ("label", "탭이름", 120), ("file", "파일", 200),
+            ("sheet", "시트", 90), ("header", "헤더", 60), ("start_row", "시작행", 60),
+            ("search", "검색열", 90), ("cols", "가져올열 수", 90),
         ]
         for key, text, w in headers:
             self.tree_sources.heading(key, text=text)
-            self.tree_sources.column(key, width=w, anchor="center" if key in ("use", "cols") else "w")
+            self.tree_sources.column(key, width=w, anchor="center" if key in ("use", "cols", "start_row") else "w")
         self.tree_sources.pack(fill="both", expand=True, padx=8, pady=8)
 
         btn_frm = ttk.Frame(frm)
@@ -534,7 +633,8 @@ class ExcelSearchMergerApp(tk.Tk):
             self.tree_sources.insert(
                 "", "end", iid=str(i),
                 values=("O" if c.enabled else "X", c.label, os.path.basename(c.file_path),
-                        c.sheet_name, "있음" if c.has_header else "없음", c.search_header, len(c.columns))
+                        c.sheet_name, "있음" if c.has_header else "없음", c.start_row,
+                        c.search_header, len(c.columns))
             )
         self._refresh_output_field_choices()
 
@@ -679,6 +779,12 @@ class ExcelSearchMergerApp(tk.Tk):
         self.var_case_insensitive = tk.BooleanVar(value=True)
         ttk.Checkbutton(opt_frm, text="대소문자 구분 안 함", variable=self.var_case_insensitive).pack(side="left")
 
+        self.var_ignore_space = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            opt_frm, text="띄어쓰기 차이 무시 (예: '홍 길동' = '홍길동')",
+            variable=self.var_ignore_space
+        ).pack(side="left", padx=16)
+
         self.var_merge_mode = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             opt_frm, text="여러 탭 결과를 검색어 기준으로 한 행에 병합(권장)",
@@ -712,6 +818,7 @@ class ExcelSearchMergerApp(tk.Tk):
         self.cache.clear()
         results: List[Dict[str, object]] = []
         case_ins = self.var_case_insensitive.get()
+        ignore_space = self.var_ignore_space.get()
         merge_mode = self.var_merge_mode.get()
 
         try:
@@ -723,8 +830,8 @@ class ExcelSearchMergerApp(tk.Tk):
                     # - 매치가 1건뿐인 탭(예: 직원목록)의 값은 모든 행에 동일하게 채워 넣는다(반복).
                     per_config_matches = []
                     for cfg in active_configs:
-                        headers, rows = self.cache.get(cfg.file_path, cfg.sheet_name, cfg.has_header)
-                        matches = search_in_config(cfg, headers, rows, term, case_ins)
+                        headers, rows = self.cache.get(cfg.file_path, cfg.sheet_name, cfg.has_header, cfg.start_row)
+                        matches = search_in_config(cfg, headers, rows, term, case_ins, ignore_space)
                         per_config_matches.append((cfg, matches))
 
                     match_counts = [len(m) for _, m in per_config_matches if len(m) > 0]
@@ -749,8 +856,8 @@ class ExcelSearchMergerApp(tk.Tk):
                 else:
                     # 쌓기 모드(기존 방식): 탭별로 매치된 행을 각각 별도의 결과 행으로 추가
                     for cfg in active_configs:
-                        headers, rows = self.cache.get(cfg.file_path, cfg.sheet_name, cfg.has_header)
-                        matches = search_in_config(cfg, headers, rows, term, case_ins)
+                        headers, rows = self.cache.get(cfg.file_path, cfg.sheet_name, cfg.has_header, cfg.start_row)
+                        matches = search_in_config(cfg, headers, rows, term, case_ins, ignore_space)
                         for m in matches:
                             rec = dict(m)
                             rec[SEARCH_TERM_KEY] = term
@@ -767,7 +874,7 @@ class ExcelSearchMergerApp(tk.Tk):
             diag_lines = ["검색 결과가 없습니다. 아래 진단 정보를 확인해 주세요.\n"]
             for cfg in active_configs:
                 try:
-                    headers, rows = self.cache.get(cfg.file_path, cfg.sheet_name, cfg.has_header)
+                    headers, rows = self.cache.get(cfg.file_path, cfg.sheet_name, cfg.has_header, cfg.start_row)
                 except Exception as e:
                     diag_lines.append(f"[{cfg.label}] 파일/시트를 읽는 중 오류: {e}")
                     continue
@@ -775,17 +882,18 @@ class ExcelSearchMergerApp(tk.Tk):
                 if cfg.search_header not in headers:
                     diag_lines.append(
                         f"[{cfg.label}] 설정된 검색열 '{cfg.search_header}' 을(를) "
-                        f"시트의 첫 번째 행(헤더)에서 찾지 못했습니다.\n"
+                        f"시트의 지정된 헤더 행(현재 {cfg.start_row}행)에서 찾지 못했습니다.\n"
                         f"    이 시트의 실제 헤더 목록: {headers}\n"
-                        f"    → 시트 맨 위에 제목/병합된 셀이 있어서 1행이 실제 헤더가 아닐 수 있습니다.\n"
-                        f"    → 이 시트에 헤더(제목행) 자체가 없다면, 소스 설정에서 "
-                        f"'헤더 없음' 옵션을 켜고 검색열을 A,B,C.. 열 문자로 지정하세요."
+                        f"    → 시트 맨 위에 제목/병합된 셀이 있어서 지정한 행이 실제 헤더가 아닐 수 있습니다.\n"
+                        f"    → 소스 설정에서 '헤더/데이터 시작 행' 값을 실제 헤더가 있는 행 번호로 조정하세요.\n"
+                        f"    → 이 시트에 헤더(제목행) 자체가 없다면, '헤더 없음' 옵션을 켜고 "
+                        f"검색열을 A,B,C.. 열 문자로 지정하세요."
                     )
                     continue
 
                 total = 0
                 for term in terms:
-                    total += len(search_in_config(cfg, headers, rows, term, case_ins))
+                    total += len(search_in_config(cfg, headers, rows, term, case_ins, ignore_space))
 
                 search_idx = headers.index(cfg.search_header)
                 sample_vals = []
@@ -882,6 +990,7 @@ class ExcelSearchMergerApp(tk.Tk):
                     "match_mode": c.match_mode,
                     "enabled": c.enabled,
                     "has_header": c.has_header,
+                    "start_row": c.start_row,
                     "columns": [{"source_header": cm.source_header, "alias": cm.alias} for cm in c.columns],
                 }
                 for c in self.configs
@@ -906,6 +1015,7 @@ class ExcelSearchMergerApp(tk.Tk):
                 match_mode=cd.get("match_mode", "contains"),
                 enabled=cd.get("enabled", True),
                 has_header=cd.get("has_header", True),
+                start_row=cd.get("start_row", 1),
                 columns=cols,
             ))
         output_columns = [
