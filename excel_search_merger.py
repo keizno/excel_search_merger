@@ -44,6 +44,7 @@ from tkinter import ttk, filedialog, messagebox
 try:
     from openpyxl import Workbook, load_workbook
     from openpyxl.utils import get_column_letter, column_index_from_string
+    from openpyxl.styles import Alignment
 except ImportError:
     print("openpyxl 이 설치되어 있지 않습니다. 다음 명령으로 설치하세요:")
     print("    pip install openpyxl")
@@ -311,10 +312,12 @@ def open_file_with_default_app(path: str):
 class SourceConfigDialog(tk.Toplevel):
     """소스 설정(탭) 추가/편집 창"""
 
-    def __init__(self, master, config: Optional[SourceConfig] = None):
+    def __init__(self, master, config: Optional[SourceConfig] = None,
+                 default_file: Optional[str] = None, default_sheet: Optional[str] = None,
+                 default_has_header: Optional[bool] = None, default_start_row: Optional[int] = None):
         super().__init__(master)
         self.title("소스(탭) 설정")
-        self.geometry("640x590")
+        self.geometry("760x640")
         self.resizable(False, False)
         self.grab_set()
 
@@ -322,10 +325,17 @@ class SourceConfigDialog(tk.Toplevel):
         self.available_headers: List[str] = []
 
         self._editing = config
+        self._default_file = default_file
+        self._default_sheet = default_sheet
+        self._default_has_header = default_has_header
+        self._default_start_row = default_start_row
+
         self._build_ui()
 
         if config is not None:
             self._load_from_config(config)
+        elif self._default_file and self.var_same_file.get():
+            self._apply_default_file()
 
     # -- UI 구성 --------------------------------------------------------
     def _build_ui(self):
@@ -333,59 +343,81 @@ class SourceConfigDialog(tk.Toplevel):
 
         frm_top = ttk.Frame(self)
         frm_top.pack(fill="x", **pad)
+        frm_top.grid_columnconfigure(1, weight=1)
 
-        ttk.Label(frm_top, text="탭 이름(구분용):").grid(row=0, column=0, sticky="w")
+        r = 0
+        ttk.Label(frm_top, text="탭 이름(구분용):").grid(row=r, column=0, sticky="w")
         self.var_label = tk.StringVar()
-        ttk.Entry(frm_top, textvariable=self.var_label, width=30).grid(row=0, column=1, sticky="w")
+        ttk.Entry(frm_top, textvariable=self.var_label, width=30).grid(row=r, column=1, sticky="w")
+        r += 1
 
-        ttk.Label(frm_top, text="엑셀 파일:").grid(row=1, column=0, sticky="w")
+        ttk.Label(frm_top, text="엑셀 파일:").grid(row=r, column=0, sticky="w")
         self.var_file = tk.StringVar()
-        ttk.Entry(frm_top, textvariable=self.var_file, width=48, state="readonly").grid(
-            row=1, column=1, columnspan=2, sticky="we")
-        ttk.Button(frm_top, text="파일 선택", command=self._choose_file).grid(row=1, column=3, padx=4)
+        ttk.Entry(frm_top, textvariable=self.var_file, state="readonly").grid(
+            row=r, column=1, sticky="we", padx=(0, 4))
+        ttk.Button(frm_top, text="파일 선택", command=self._choose_file).grid(row=r, column=2, sticky="e")
+        r += 1
 
-        ttk.Label(frm_top, text="시트:").grid(row=2, column=0, sticky="w")
+        self.var_same_file = tk.BooleanVar(value=bool(self._default_file))
+        cb_same_file = ttk.Checkbutton(
+            frm_top, text="이전에 등록한 것과 동일한 파일 사용 (탭 이름/검색 조건만 바꿔서 추가)",
+            variable=self.var_same_file, command=self._on_toggle_same_file
+        )
+        if self._editing is None:
+            cb_same_file.grid(row=r, column=0, columnspan=3, sticky="w")
+            if not self._default_file:
+                cb_same_file.state(["disabled"])
+        r += 1
+
+        ttk.Label(frm_top, text="시트:").grid(row=r, column=0, sticky="w")
         self.var_sheet = tk.StringVar()
         self.cb_sheet = ttk.Combobox(frm_top, textvariable=self.var_sheet, state="readonly", width=30)
-        self.cb_sheet.grid(row=2, column=1, sticky="w")
+        self.cb_sheet.grid(row=r, column=1, sticky="w")
         self.cb_sheet.bind("<<ComboboxSelected>>", lambda e: self._load_headers())
+        r += 1
 
         self.var_no_header = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            frm_top, text="이 시트는 헤더(제목행)가 없음 - 지정한 행부터 데이터, 열은 A,B,C.. 로 지정",
+            frm_top, text="이 시트는 헤더(제목행)가 없음 (열을 A,B,C.. 로 지정)",
             variable=self.var_no_header, command=self._load_headers
-        ).grid(row=2, column=2, columnspan=2, sticky="w", padx=(12, 0))
+        ).grid(row=r, column=0, columnspan=3, sticky="w")
+        r += 1
 
-        ttk.Label(frm_top, text="헤더/데이터 시작 행:").grid(row=3, column=0, sticky="w")
+        ttk.Label(frm_top, text="헤더/데이터 시작 행:").grid(row=r, column=0, sticky="w")
         self.var_start_row = tk.IntVar(value=1)
         self.sb_start_row = ttk.Spinbox(
             frm_top, from_=1, to=100000, textvariable=self.var_start_row, width=8,
             command=self._load_headers
         )
-        self.sb_start_row.grid(row=3, column=1, sticky="w")
+        self.sb_start_row.grid(row=r, column=1, sticky="w")
         self.sb_start_row.bind("<FocusOut>", lambda e: self._load_headers())
         self.sb_start_row.bind("<Return>", lambda e: self._load_headers())
+        r += 1
         ttk.Label(
             frm_top,
             text="(위쪽에 빈 행/제목行/병합된 행이 있으면 실제 헤더(또는 데이터)가 시작되는 행 번호를 입력. 병합된 셀은 값이 자동으로 채워집니다)",
-            foreground="#666", wraplength=340, justify="left"
-        ).grid(row=3, column=2, columnspan=2, sticky="w", padx=(12, 0))
+            foreground="#666", wraplength=680, justify="left"
+        ).grid(row=r, column=0, columnspan=3, sticky="w")
+        r += 1
 
-        ttk.Label(frm_top, text="검색할 열:").grid(row=4, column=0, sticky="w")
+        ttk.Label(frm_top, text="검색할 열:").grid(row=r, column=0, sticky="w")
         self.var_search_col = tk.StringVar()
         self.cb_search_col = ttk.Combobox(frm_top, textvariable=self.var_search_col, width=30)
-        self.cb_search_col.grid(row=4, column=1, sticky="w")
+        self.cb_search_col.grid(row=r, column=1, sticky="w")
+        r += 1
         ttk.Label(
             frm_top, text="(목록에서 선택하거나, 열 문자를 직접 입력해도 됩니다. 예: C)",
             foreground="#666"
-        ).grid(row=4, column=2, columnspan=2, sticky="w", padx=(12, 0))
+        ).grid(row=r, column=0, columnspan=3, sticky="w")
+        r += 1
 
-        ttk.Label(frm_top, text="검색 방식:").grid(row=5, column=0, sticky="w")
+        ttk.Label(frm_top, text="검색 방식:").grid(row=r, column=0, sticky="w")
         self.var_match = tk.StringVar(value="contains")
         frm_match = ttk.Frame(frm_top)
-        frm_match.grid(row=5, column=1, sticky="w")
+        frm_match.grid(row=r, column=1, sticky="w")
         ttk.Radiobutton(frm_match, text="부분일치(포함)", variable=self.var_match, value="contains").pack(side="left")
         ttk.Radiobutton(frm_match, text="완전일치", variable=self.var_match, value="exact").pack(side="left")
+        r += 1
 
         # 가져올 열 매핑 영역
         frm_cols = ttk.LabelFrame(self, text="가져올 열 (원본 열 -> 출력 별칭)")
@@ -434,6 +466,9 @@ class SourceConfigDialog(tk.Toplevel):
         )
         if not path:
             return
+        # 사용자가 직접 다른 파일을 골랐으므로 '동일 파일 사용' 체크는 해제
+        if hasattr(self, "var_same_file"):
+            self.var_same_file.set(False)
         self.var_file.set(path)
         try:
             sheets = SheetCache.list_sheets(path)
@@ -444,6 +479,39 @@ class SourceConfigDialog(tk.Toplevel):
         if sheets:
             self.var_sheet.set(sheets[0])
             self._load_headers()
+
+    def _apply_default_file(self):
+        """이전에 등록한 소스와 동일한 파일/시트/헤더 설정을 그대로 불러온다."""
+        path = self._default_file
+        if not path:
+            return
+        self.var_file.set(path)
+        try:
+            sheets = SheetCache.list_sheets(path)
+        except Exception as e:
+            messagebox.showerror("오류", f"파일을 여는 중 오류가 발생했습니다:\n{e}", parent=self)
+            return
+        self.cb_sheet["values"] = sheets
+        sheet = self._default_sheet if self._default_sheet in sheets else (sheets[0] if sheets else "")
+        self.var_sheet.set(sheet)
+        if self._default_has_header is not None:
+            self.var_no_header.set(not self._default_has_header)
+        if self._default_start_row is not None:
+            self.var_start_row.set(self._default_start_row)
+        if sheet:
+            self._load_headers()
+
+    def _on_toggle_same_file(self):
+        if self.var_same_file.get():
+            self._apply_default_file()
+        else:
+            self.var_file.set("")
+            self.var_sheet.set("")
+            self.cb_sheet["values"] = []
+            self.var_search_col.set("")
+            self.available_headers = []
+            self.cb_search_col["values"] = []
+            self.cb_new_source["values"] = []
 
     def _load_headers(self):
         path = self.var_file.get()
@@ -639,7 +707,14 @@ class ExcelSearchMergerApp(tk.Tk):
         self._refresh_output_field_choices()
 
     def _add_source(self):
-        dlg = SourceConfigDialog(self)
+        last = self.configs[-1] if self.configs else None
+        dlg = SourceConfigDialog(
+            self,
+            default_file=last.file_path if last else None,
+            default_sheet=last.sheet_name if last else None,
+            default_has_header=last.has_header if last else None,
+            default_start_row=last.start_row if last else None,
+        )
         self.wait_window(dlg)
         if dlg.result:
             self.configs.append(dlg.result)
@@ -696,15 +771,23 @@ class ExcelSearchMergerApp(tk.Tk):
         self.var_out_header = tk.StringVar()
         ttk.Entry(frm_add, textvariable=self.var_out_header, width=22).pack(side="left", padx=4)
 
-        ttk.Button(frm_add, text="추가", command=self._add_output_column).pack(side="left", padx=6)
+        self.var_out_add_btn = tk.StringVar(value="추가")
+        self._editing_output_idx: Optional[int] = None
+        ttk.Button(frm_add, textvariable=self.var_out_add_btn, command=self._add_output_column).pack(
+            side="left", padx=6)
+        ttk.Button(frm_add, text="선택 수정", command=self._edit_output_column).pack(side="left", padx=2)
+        ttk.Button(frm_add, text="수정 취소", command=self._cancel_edit_output_column).pack(side="left", padx=2)
         ttk.Button(frm_add, text="선택 삭제", command=self._remove_output_column).pack(side="left", padx=2)
         ttk.Button(frm_add, text="위로", command=lambda: self._move_output_column(-1)).pack(side="left", padx=2)
         ttk.Button(frm_add, text="아래로", command=lambda: self._move_output_column(1)).pack(side="left", padx=2)
 
+        self.tree_output.bind("<Double-1>", lambda e: self._edit_output_column())
+
         ttk.Label(
             frm,
-            text="※ 필드는 [검색어], [출처 탭이름], 또는 소스 설정에서 지정한 '출력 별칭' 중에서 고를 수 있습니다.",
-            foreground="#555"
+            text="※ 필드는 [검색어], [출처 탭이름], 또는 소스 설정에서 지정한 '출력 별칭' 중에서 고를 수 있습니다.\n"
+                 "※ 목록에서 더블클릭하거나 '선택 수정'을 누르면 값을 불러와 바로 수정할 수 있습니다.",
+            foreground="#555", justify="left"
         ).pack(anchor="w", padx=8, pady=(0, 8))
 
     def _refresh_output_field_choices(self):
@@ -734,13 +817,35 @@ class ExcelSearchMergerApp(tk.Tk):
         field_label = self.var_out_field.get().strip()
         header = self.var_out_header.get().strip()
         if not field_label:
-            messagebox.showwarning("확인", "필드를 선택하세요.", parent=self)
+            messagebox.showwarning("확인", "필드를 선택하세요.")
             return
         if not header:
             header = field_label
         key = self._field_label_to_key(field_label)
-        self.output_columns.append(OutputColumn(field_key=key, header=header))
+
+        if self._editing_output_idx is not None:
+            self.output_columns[self._editing_output_idx] = OutputColumn(field_key=key, header=header)
+        else:
+            self.output_columns.append(OutputColumn(field_key=key, header=header))
+
+        self._cancel_edit_output_column()
         self._refresh_output_tree()
+
+    def _edit_output_column(self):
+        sel = self.tree_output.selection()
+        if not sel:
+            messagebox.showinfo("확인", "수정할 항목을 선택하세요.")
+            return
+        idx = self.tree_output.index(sel[0])
+        oc = self.output_columns[idx]
+        self.var_out_field.set(self._field_key_to_label(oc.field_key))
+        self.var_out_header.set(oc.header)
+        self._editing_output_idx = idx
+        self.var_out_add_btn.set("수정 저장")
+
+    def _cancel_edit_output_column(self):
+        self._editing_output_idx = None
+        self.var_out_add_btn.set("추가")
         self.var_out_field.set("")
         self.var_out_header.set("")
 
@@ -751,12 +856,14 @@ class ExcelSearchMergerApp(tk.Tk):
         indices = sorted((self.tree_output.index(i) for i in sel), reverse=True)
         for i in indices:
             del self.output_columns[i]
+        self._cancel_edit_output_column()
         self._refresh_output_tree()
 
     def _move_output_column(self, delta: int):
         sel = self.tree_output.selection()
         if not sel:
             return
+        self._cancel_edit_output_column()
         idx = self.tree_output.index(sel[0])
         new_idx = idx + delta
         if 0 <= new_idx < len(self.output_columns):
@@ -922,8 +1029,8 @@ class ExcelSearchMergerApp(tk.Tk):
         self.tree_result["columns"] = cols
         self.tree_result.delete(*self.tree_result.get_children())
         for c in cols:
-            self.tree_result.heading(c, text=c)
-            self.tree_result.column(c, width=140, anchor="w")
+            self.tree_result.heading(c, text=c, anchor="center")
+            self.tree_result.column(c, width=140, anchor="center")
 
         for rec in results:
             row_vals = []
@@ -969,6 +1076,12 @@ class ExcelSearchMergerApp(tk.Tk):
                     max_len = max(max_len, len(str(v)))
                 letter = ws.cell(row=1, column=col_idx).column_letter
                 ws.column_dimensions[letter].width = min(max_len + 4, 60)
+
+            # 헤더/데이터 모든 셀 가운데 정렬
+            center_align = Alignment(horizontal="center", vertical="center")
+            for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=len(headers)):
+                for cell in row:
+                    cell.alignment = center_align
 
             wb.save(path)
         except Exception as e:
