@@ -85,7 +85,9 @@ class SourceConfig:
     has_header: bool = True         # False면 지정한 행부터 데이터로 취급하고 열을 A,B,C.. 문자로 지정
     start_row: int = 1              # 헤더가 있으면 헤더가 위치한 행 번호, 없으면 데이터가 시작하는 행 번호
                                      # (위쪽에 빈 행/제목行/병합된 행이 있을 때 그 다음 실제 행을 지정)
-    resolve_merges: bool = False    # True면 병합된 셀 값을 병합 범위 전체에 채워 넣음(느림). 필요할 때만 켤 것
+    resolve_merges: bool = True     # True면 병합된 셀 값을 병합 범위 전체에 채워 넣음
+    fill_blank_down: bool = True    # True면 병합은 아니지만 비어있는 셀을 바로 위 행의 값으로 채움
+                                     # (예: 이름을 첫 행에만 적고 그 아래는 비워둔 경우)
     columns: List[ColumnMap] = field(default_factory=list)
 
 
@@ -158,6 +160,28 @@ def _read_sheet_with_merges(file_path: str, sheet_name: str) -> Tuple[List[list]
         wb.close()
 
 
+def _fill_blank_down(data_rows: List[tuple]) -> List[tuple]:
+    """병합되어 있지 않지만 비어있는 셀을, 같은 열의 바로 위 행에서 나온 값으로 채운다.
+    (예: 이름을 첫 구매 행에만 적고, 같은 사람의 다음 구매 행들은 비워둔 경우)"""
+    if not data_rows:
+        return data_rows
+    ncols = max(len(r) for r in data_rows)
+    prev = [None] * ncols
+    result = []
+    for row in data_rows:
+        row = list(row) + [None] * (ncols - len(row))
+        new_row = []
+        for i in range(ncols):
+            v = row[i]
+            if v is None or (isinstance(v, str) and v.strip() == ""):
+                new_row.append(prev[i])
+            else:
+                new_row.append(v)
+                prev[i] = v
+        result.append(tuple(new_row))
+    return result
+
+
 def _split_headers_and_data(rows: List[list], max_col: int, has_header: bool,
                              start_row: int) -> Tuple[List[str], List[tuple]]:
     """읽어들인 2차원 데이터에서, 지정한 시작 행부터 헤더/데이터를 분리한다."""
@@ -180,8 +204,8 @@ class SheetCache:
     def __init__(self):
         # (file_path, sheet_name, resolve_merges) -> (rows, max_col) : 원본 2차원 데이터
         self._raw_cache: Dict[Tuple[str, str, bool], Tuple[List[list], int]] = {}
-        # (file_path, sheet_name, resolve_merges, has_header, start_row) -> (headers, data_rows)
-        self._cache: Dict[Tuple[str, str, bool, bool, int], Tuple[List[str], List[tuple]]] = {}
+        # (file_path, sheet_name, resolve_merges, has_header, start_row, fill_blank_down) -> (headers, data_rows)
+        self._cache: Dict[Tuple[str, str, bool, bool, int, bool], Tuple[List[str], List[tuple]]] = {}
 
     def _get_raw(self, file_path: str, sheet_name: str, resolve_merges: bool) -> Tuple[List[list], int]:
         key = (file_path, sheet_name, resolve_merges)
@@ -195,13 +219,16 @@ class SheetCache:
         return rows, max_col
 
     def get(self, file_path: str, sheet_name: str, has_header: bool = True,
-            start_row: int = 1, resolve_merges: bool = False) -> Tuple[List[str], List[tuple]]:
-        key = (file_path, sheet_name, resolve_merges, has_header, start_row)
+            start_row: int = 1, resolve_merges: bool = False,
+            fill_blank_down: bool = False) -> Tuple[List[str], List[tuple]]:
+        key = (file_path, sheet_name, resolve_merges, has_header, start_row, fill_blank_down)
         if key in self._cache:
             return self._cache[key]
 
         rows, max_col = self._get_raw(file_path, sheet_name, resolve_merges)
         headers, data_rows = _split_headers_and_data(rows, max_col, has_header, start_row)
+        if fill_blank_down:
+            data_rows = _fill_blank_down(data_rows)
 
         self._cache[key] = (headers, data_rows)
         return headers, data_rows
@@ -317,7 +344,7 @@ class SourceConfigDialog(tk.Toplevel):
                  default_has_header: Optional[bool] = None, default_start_row: Optional[int] = None):
         super().__init__(master)
         self.title("소스(탭) 설정")
-        self.geometry("760x640")
+        self.geometry("760x700")
         self.resizable(False, False)
         self.grab_set()
 
@@ -380,6 +407,21 @@ class SourceConfigDialog(tk.Toplevel):
         ttk.Checkbutton(
             frm_top, text="이 시트는 헤더(제목행)가 없음 (열을 A,B,C.. 로 지정)",
             variable=self.var_no_header, command=self._load_headers
+        ).grid(row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+
+        self.var_resolve_merges = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frm_top, text="병합된 셀 값 자동 채우기 (병합 범위 전체에 좌상단 값 적용)",
+            variable=self.var_resolve_merges, command=self._load_headers
+        ).grid(row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+
+        self.var_fill_blank = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frm_top, text="병합은 아니지만 비어있는 셀도 바로 위 행의 값으로 채우기 "
+                          "(예: 이름을 첫 행에만 적고 그 아래는 비워둔 경우)",
+            variable=self.var_fill_blank, command=self._load_headers
         ).grid(row=r, column=0, columnspan=3, sticky="w")
         r += 1
 
@@ -571,6 +613,8 @@ class SourceConfigDialog(tk.Toplevel):
         self.var_sheet.set(config.sheet_name)
         self.var_no_header.set(not config.has_header)
         self.var_start_row.set(config.start_row)
+        self.var_resolve_merges.set(config.resolve_merges)
+        self.var_fill_blank.set(config.fill_blank_down)
         self._load_headers()
         self.var_search_col.set(config.search_header)
         self.var_match.set(config.match_mode)
@@ -621,6 +665,8 @@ class SourceConfigDialog(tk.Toplevel):
             enabled=enabled,
             has_header=not self.var_no_header.get(),
             start_row=start_row,
+            resolve_merges=self.var_resolve_merges.get(),
+            fill_blank_down=self.var_fill_blank.get(),
             columns=columns,
         )
         self.destroy()
@@ -877,7 +923,8 @@ class ExcelSearchMergerApp(tk.Tk):
     def _build_tab_run(self):
         frm = self.tab_run
 
-        ttk.Label(frm, text="검색어 입력 (한 줄에 하나씩):").pack(anchor="w", padx=8, pady=(8, 0))
+        ttk.Label(frm, text="검색어 입력 (한 줄에 하나씩) - Ctrl+Enter로 검색 실행:").pack(
+            anchor="w", padx=8, pady=(8, 0))
         self.txt_terms = tk.Text(frm, height=6)
         self.txt_terms.pack(fill="x", padx=8, pady=4)
 
@@ -900,7 +947,7 @@ class ExcelSearchMergerApp(tk.Tk):
 
         btn_frm = ttk.Frame(frm)
         btn_frm.pack(fill="x", padx=8, pady=6)
-        ttk.Button(btn_frm, text="검색 실행", command=self._run_search).pack(side="left")
+        ttk.Button(btn_frm, text="검색 실행 (Ctrl+Enter)", command=self._run_search).pack(side="left")
         ttk.Button(btn_frm, text="엑셀로 저장", command=self._save_results).pack(side="left", padx=6)
 
         self.lbl_status = ttk.Label(frm, text="검색 결과: 0건")
@@ -908,6 +955,38 @@ class ExcelSearchMergerApp(tk.Tk):
 
         self.tree_result = ttk.Treeview(frm, show="headings", height=16)
         self.tree_result.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # Ctrl+Enter: 검색어 입력창 어디서든 바로 검색 실행 (줄바꿈 삽입 방지)
+        self.txt_terms.bind("<Control-Return>", self._run_search_shortcut)
+        # Ctrl+C: 결과 표에서 선택 행(또는 선택이 없으면 전체)을 클립보드로 복사
+        self.tree_result.bind("<Control-c>", self._copy_results_to_clipboard)
+        self.tree_result.bind("<Control-C>", self._copy_results_to_clipboard)
+
+    def _run_search_shortcut(self, event=None):
+        self._run_search()
+        return "break"
+
+    def _copy_results_to_clipboard(self, event=None):
+        cols = self.tree_result["columns"]
+        if not cols:
+            return "break"
+        sel = self.tree_result.selection()
+        if sel:
+            items = sel
+            lines = []
+        else:
+            items = self.tree_result.get_children()
+            lines = ["\t".join(str(c) for c in cols)]
+        for iid in items:
+            vals = self.tree_result.item(iid, "values")
+            lines.append("\t".join("" if v is None else str(v) for v in vals))
+        if not lines:
+            return "break"
+        text = "\n".join(lines)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update()
+        return "break"
 
     def _run_search(self):
         if not self.configs:
@@ -937,7 +1016,7 @@ class ExcelSearchMergerApp(tk.Tk):
                     # - 매치가 1건뿐인 탭(예: 직원목록)의 값은 모든 행에 동일하게 채워 넣는다(반복).
                     per_config_matches = []
                     for cfg in active_configs:
-                        headers, rows = self.cache.get(cfg.file_path, cfg.sheet_name, cfg.has_header, cfg.start_row)
+                        headers, rows = self.cache.get(cfg.file_path, cfg.sheet_name, cfg.has_header, cfg.start_row, cfg.resolve_merges, cfg.fill_blank_down)
                         matches = search_in_config(cfg, headers, rows, term, case_ins, ignore_space)
                         per_config_matches.append((cfg, matches))
 
@@ -963,7 +1042,7 @@ class ExcelSearchMergerApp(tk.Tk):
                 else:
                     # 쌓기 모드(기존 방식): 탭별로 매치된 행을 각각 별도의 결과 행으로 추가
                     for cfg in active_configs:
-                        headers, rows = self.cache.get(cfg.file_path, cfg.sheet_name, cfg.has_header, cfg.start_row)
+                        headers, rows = self.cache.get(cfg.file_path, cfg.sheet_name, cfg.has_header, cfg.start_row, cfg.resolve_merges, cfg.fill_blank_down)
                         matches = search_in_config(cfg, headers, rows, term, case_ins, ignore_space)
                         for m in matches:
                             rec = dict(m)
@@ -981,7 +1060,7 @@ class ExcelSearchMergerApp(tk.Tk):
             diag_lines = ["검색 결과가 없습니다. 아래 진단 정보를 확인해 주세요.\n"]
             for cfg in active_configs:
                 try:
-                    headers, rows = self.cache.get(cfg.file_path, cfg.sheet_name, cfg.has_header, cfg.start_row)
+                    headers, rows = self.cache.get(cfg.file_path, cfg.sheet_name, cfg.has_header, cfg.start_row, cfg.resolve_merges, cfg.fill_blank_down)
                 except Exception as e:
                     diag_lines.append(f"[{cfg.label}] 파일/시트를 읽는 중 오류: {e}")
                     continue
@@ -1104,6 +1183,8 @@ class ExcelSearchMergerApp(tk.Tk):
                     "enabled": c.enabled,
                     "has_header": c.has_header,
                     "start_row": c.start_row,
+                    "resolve_merges": c.resolve_merges,
+                    "fill_blank_down": c.fill_blank_down,
                     "columns": [{"source_header": cm.source_header, "alias": cm.alias} for cm in c.columns],
                 }
                 for c in self.configs
@@ -1129,6 +1210,8 @@ class ExcelSearchMergerApp(tk.Tk):
                 enabled=cd.get("enabled", True),
                 has_header=cd.get("has_header", True),
                 start_row=cd.get("start_row", 1),
+                resolve_merges=cd.get("resolve_merges", True),
+                fill_blank_down=cd.get("fill_blank_down", True),
                 columns=cols,
             ))
         output_columns = [
